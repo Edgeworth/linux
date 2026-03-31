@@ -30,6 +30,7 @@ use crate::{
         Architecture,
         Chipset, //
     },
+    mm::pramin::Bar0WindowTarget,
     num::FromSafeCast,
 };
 
@@ -107,6 +108,13 @@ impl kernel::fmt::Display for NV_PMC_BOOT_42 {
 // PBUS
 
 register! {
+    /// BAR0 window control for PRAMIN access.
+    pub(crate) NV_PBUS_BAR0_WINDOW(u32) @ 0x00001700 {
+        25:24   target ?=> Bar0WindowTarget;
+        /// Window base address (bits 39:16 of FB addr).
+        23:0    window_base;
+    }
+
     pub(crate) NV_PBUS_SW_SCRATCH(u32)[64] @ 0x00001400 {}
 
     /// Scratch register 0xe used as FRTS firmware error code.
