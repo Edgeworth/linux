@@ -34,14 +34,17 @@
 //!
 //! The walker returns a [`WalkResult`] indicating the outcome.
 
+use core::marker::PhantomData;
+
 use kernel::prelude::*;
 
 use super::{
-    DualPde,
-    MmuVersion,
+    DualPdeOps,
+    Mmu,
     PageTableLevel,
-    Pde,
-    Pte, //
+    PdeOps,
+    PteOps,
+    VaLevelIndex, //
 };
 use crate::{
     mm::{
@@ -92,28 +95,23 @@ pub(crate) enum WalkPdeResult {
 ///
 /// Walks the page table hierarchy (5 levels for v2, 6 for v3) to find PTE
 /// locations or resolve virtual addresses.
-pub(crate) struct PtWalk {
+pub(crate) struct PtWalk<M: Mmu> {
     pdb_addr: VramAddress,
-    mmu_version: MmuVersion,
+    _mmu: PhantomData<M>,
 }
 
-impl PtWalk {
+impl<M: Mmu> PtWalk<M> {
     /// Calculate the VRAM address of an entry within a page table.
-    fn entry_addr(
-        table: VramAddress,
-        mmu_version: MmuVersion,
-        level: PageTableLevel,
-        index: u64,
-    ) -> VramAddress {
-        let entry_size: u64 = mmu_version.entry_size(level).into_safe_cast();
+    fn entry_addr(table: VramAddress, level: PageTableLevel, index: u64) -> VramAddress {
+        let entry_size: u64 = M::entry_size(level).into_safe_cast();
         VramAddress::new(table.raw_u64() + index * entry_size)
     }
 
     /// Create a new page table walker.
-    pub(crate) fn new(pdb_addr: VramAddress, mmu_version: MmuVersion) -> Self {
+    pub(crate) fn new(pdb_addr: VramAddress) -> Self {
         Self {
             pdb_addr,
-            mmu_version,
+            _mmu: PhantomData,
         }
     }
 
@@ -128,23 +126,23 @@ impl PtWalk {
         vfn: Vfn,
         resolve_prepared: impl Fn(VramAddress) -> Option<VramAddress>,
     ) -> Result<WalkPdeResult> {
-        let va = VirtualAddress::from(vfn);
+        let va = M::va(VirtualAddress::from(vfn));
         let mut cur_table = self.pdb_addr;
 
-        for &level in self.mmu_version.pde_levels() {
-            let idx = self.mmu_version.level_index(va, level.as_index());
-            let install_addr = Self::entry_addr(cur_table, self.mmu_version, level, idx);
+        for &level in M::PDE_LEVELS {
+            let idx = va.level_index(level);
+            let install_addr = Self::entry_addr(cur_table, level, idx);
 
-            if level == self.mmu_version.dual_pde_level() {
+            if level == M::DUAL_PDE_LEVEL {
                 // 128-bit dual PDE with big+small page table pointers.
-                let dpde = DualPde::read(window, install_addr, self.mmu_version)?;
+                let dpde = M::DualPde::read(window, install_addr)?;
                 if dpde.has_small() {
                     cur_table = dpde.small_vram_address();
                     continue;
                 }
             } else {
                 // Regular 64-bit PDE.
-                let pde = Pde::read(window, install_addr, self.mmu_version)?;
+                let pde = M::Pde::read(window, install_addr)?;
                 if pde.is_valid() {
                     cur_table = pde.table_vram_address();
                     continue;
@@ -187,9 +185,7 @@ impl PtWalk {
         vfn: Vfn,
     ) -> Result<WalkResult> {
         match self.walk_pde_levels(window, vfn, |_| None)? {
-            WalkPdeResult::Complete { pte_table } => {
-                Self::read_pte_at_level(window, vfn, pte_table, self.mmu_version)
-            }
+            WalkPdeResult::Complete { pte_table } => Self::read_pte_at_level(window, vfn, pte_table),
             WalkPdeResult::Missing { .. } => Ok(WalkResult::PageTableMissing),
         }
     }
@@ -199,13 +195,11 @@ impl PtWalk {
         window: &mut pramin::PraminWindow<'_>,
         vfn: Vfn,
         pte_table: VramAddress,
-        mmu_version: MmuVersion,
     ) -> Result<WalkResult> {
-        let va = VirtualAddress::from(vfn);
-        let pte_level = mmu_version.pte_level();
-        let pte_idx = mmu_version.level_index(va, pte_level.as_index());
-        let pte_addr = Self::entry_addr(pte_table, mmu_version, pte_level, pte_idx);
-        let pte = Pte::read(window, pte_addr, mmu_version)?;
+        let va = M::va(VirtualAddress::from(vfn));
+        let pte_idx = va.level_index(M::PTE_LEVEL);
+        let pte_addr = Self::entry_addr(pte_table, M::PTE_LEVEL, pte_idx);
+        let pte = M::Pte::read(window, pte_addr)?;
 
         if pte.is_valid() {
             return Ok(WalkResult::Mapped {

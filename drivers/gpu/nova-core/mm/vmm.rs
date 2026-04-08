@@ -23,22 +23,26 @@ use kernel::{
 
 use core::{
     cell::Cell,
+    marker::PhantomData,
     ops::Range, //
 };
 
 use crate::{
     mm::{
         pagetable::{
+            ver2::MmuV2,
+            ver3::MmuV3,
             walk::{
                 PtWalk,
                 WalkPdeResult,
                 WalkResult, //
             },
-            DualPde,
+            DualPdeOps,
+            Mmu,
             MmuVersion,
             PageTableLevel,
-            Pde,
-            Pte, //
+            PdeOps,
+            PteOps, //
         },
         GpuMm,
         Pfn,
@@ -57,10 +61,21 @@ use crate::{
 /// Directory Base (`PDB`) address. The [`Vmm`] is used for Channel, BAR1 and
 /// BAR2 mappings.
 pub(crate) struct Vmm {
+    inner: VmmInner,
+}
+
+/// Type-erased MMU-specific [`Vmm`] implementations.
+enum VmmInner {
+    /// `Vmm` implementation for MMU v2.
+    V2(VmmImpl<MmuV2>),
+    /// `Vmm` implementation for MMU v3.
+    V3(VmmImpl<MmuV3>),
+}
+
+/// MMU-specific [`Vmm`] implementation.
+struct VmmImpl<M: Mmu> {
     /// Page Directory Base address for this address space.
-    pub(crate) pdb_addr: VramAddress,
-    /// MMU version used for page table layout.
-    pub(crate) mmu_version: MmuVersion,
+    pdb_addr: VramAddress,
     /// Page table allocations required for mappings.
     page_table_allocs: KVec<Pin<KBox<AllocatedBlocks>>>,
     /// Buddy allocator for virtual address range tracking.
@@ -71,6 +86,8 @@ pub(crate) struct Vmm {
     /// Shared by all pending maps in the `Vmm`, thus preventing races where 2
     /// maps might be trying to install the same page table/directory entry pointer.
     pt_pages: RBTree<VramAddress, PreparedPtPage>,
+    /// MMU marker carried by the type.
+    _mmu: PhantomData<M>,
 }
 
 /// A pre-allocated and zeroed page table page.
@@ -144,11 +161,75 @@ impl Vmm {
         mmu_version: MmuVersion,
         va_size: u64,
     ) -> Result<Self> {
-        // Only MMU v2 is supported for now.
-        if mmu_version != MmuVersion::V2 {
-            return Err(ENOTSUPP);
-        }
+        let inner = match mmu_version {
+            MmuVersion::V2 => VmmInner::V2(VmmImpl::<MmuV2>::new(pdb_addr, va_size)?),
+            MmuVersion::V3 => VmmInner::V3(VmmImpl::<MmuV3>::new(pdb_addr, va_size)?),
+        };
 
+        Ok(Self { inner })
+    }
+
+    /// Read the [`Pfn`] for a mapped [`Vfn`] if one is mapped.
+    pub(crate) fn read_mapping(&self, mm: &GpuMm, vfn: Vfn) -> Result<Option<Pfn>> {
+        match &self.inner {
+            VmmInner::V2(vmm) => vmm.read_mapping(mm, vfn),
+            VmmInner::V3(vmm) => vmm.read_mapping(mm, vfn),
+        }
+    }
+
+    /// Prepare resources for mapping `num_pages` pages.
+    pub(crate) fn prepare_map(
+        &mut self,
+        mm: &GpuMm,
+        num_pages: usize,
+        va_range: Option<Range<u64>>,
+    ) -> Result<PreparedMapping> {
+        match &mut self.inner {
+            VmmInner::V2(vmm) => vmm.prepare_map(mm, num_pages, va_range),
+            VmmInner::V3(vmm) => vmm.prepare_map(mm, num_pages, va_range),
+        }
+    }
+
+    /// Execute a prepared multi-page mapping.
+    pub(crate) fn execute_map(
+        &mut self,
+        mm: &GpuMm,
+        prepared: PreparedMapping,
+        pfns: &[Pfn],
+        writable: bool,
+    ) -> Result<MappedRange> {
+        match &mut self.inner {
+            VmmInner::V2(vmm) => vmm.execute_map(mm, prepared, pfns, writable),
+            VmmInner::V3(vmm) => vmm.execute_map(mm, prepared, pfns, writable),
+        }
+    }
+
+    /// Map pages doing prepare and execute in the same call.
+    pub(crate) fn map_pages(
+        &mut self,
+        mm: &GpuMm,
+        pfns: &[Pfn],
+        va_range: Option<Range<u64>>,
+        writable: bool,
+    ) -> Result<MappedRange> {
+        match &mut self.inner {
+            VmmInner::V2(vmm) => vmm.map_pages(mm, pfns, va_range, writable),
+            VmmInner::V3(vmm) => vmm.map_pages(mm, pfns, va_range, writable),
+        }
+    }
+
+    /// Unmap all pages in a [`MappedRange`] with a single TLB flush.
+    pub(crate) fn unmap_pages(&mut self, mm: &GpuMm, range: MappedRange) -> Result {
+        match &mut self.inner {
+            VmmInner::V2(vmm) => vmm.unmap_pages(mm, range),
+            VmmInner::V3(vmm) => vmm.unmap_pages(mm, range),
+        }
+    }
+}
+
+impl<M: Mmu> VmmImpl<M> {
+    /// Creates a new MMU-specific [`Vmm`] implementation.
+    fn new(pdb_addr: VramAddress, va_size: u64) -> Result<Self> {
         let virt_buddy = GpuBuddy::new(GpuBuddyParams {
             base_offset: 0,
             size: va_size,
@@ -157,10 +238,10 @@ impl Vmm {
 
         Ok(Self {
             pdb_addr,
-            mmu_version,
             page_table_allocs: KVec::new(),
             virt_buddy,
             pt_pages: RBTree::new(),
+            _mmu: PhantomData,
         })
     }
 
@@ -171,7 +252,7 @@ impl Vmm {
     /// - `num_pages`: Number of pages to allocate.
     /// - `va_range`: `None` = allocate anywhere, `Some(range)` = constrain allocation to the given
     ///   range.
-    pub(crate) fn alloc_vfn_range(
+    fn alloc_vfn_range(
         &self,
         num_pages: usize,
         va_range: Option<Range<u64>>,
@@ -210,8 +291,8 @@ impl Vmm {
     }
 
     /// Read the [`Pfn`] for a mapped [`Vfn`] if one is mapped.
-    pub(crate) fn read_mapping(&self, mm: &GpuMm, vfn: Vfn) -> Result<Option<Pfn>> {
-        let walker = PtWalk::new(self.pdb_addr, self.mmu_version);
+    fn read_mapping(&self, mm: &GpuMm, vfn: Vfn) -> Result<Option<Pfn>> {
+        let walker = PtWalk::<M>::new(self.pdb_addr);
 
         match walker.walk_to_pte_lookup(mm, vfn)? {
             WalkResult::Mapped { pfn, .. } => Ok(Some(pfn)),
@@ -260,8 +341,8 @@ impl Vmm {
     /// allocations are done outside of holding this lock to prevent deadlocks with
     /// the fence signalling critical path.
     fn ensure_pte_path(&mut self, mm: &GpuMm, vfn: Vfn) -> Result {
-        let walker = PtWalk::new(self.pdb_addr, self.mmu_version);
-        let max_iter = 2 * self.mmu_version.pde_level_count();
+        let walker = PtWalk::<M>::new(self.pdb_addr);
+        let max_iter = 2 * M::pde_level_count();
 
         // Keep looping until all PDE levels are resolved.
         for _ in 0..max_iter {
@@ -273,7 +354,7 @@ impl Vmm {
             let result = walker.walk_pde_levels(&mut window, vfn, |install_addr| {
                 self.pt_pages
                     .get(&install_addr)
-                    .and_then(|p| Some(VramAddress::new(p.alloc.iter().next()?.offset())))
+                    .and_then(|p| p.alloc.iter().next().map(|block| VramAddress::new(block.offset())))
             })?;
 
             match result {
@@ -317,7 +398,7 @@ impl Vmm {
     ///
     /// If `va_range` is not `None`, the VA range is constrained to the given range. Safe
     /// to call outside the fence signalling critical path.
-    pub(crate) fn prepare_map(
+    fn prepare_map(
         &mut self,
         mm: &GpuMm,
         num_pages: usize,
@@ -331,7 +412,7 @@ impl Vmm {
         // fence signalling critical path).
         // Upper bound on page table pages needed for the full tree (PTE pages + PDE
         // pages at all levels).
-        let pt_upper_bound = self.mmu_version.pt_pages_upper_bound(num_pages);
+        let pt_upper_bound = M::pt_pages_upper_bound(num_pages);
         self.page_table_allocs.reserve(pt_upper_bound, GFP_KERNEL)?;
 
         // Allocate contiguous VA range.
@@ -354,7 +435,7 @@ impl Vmm {
     /// Execute a prepared multi-page mapping.
     ///
     /// Drain prepared PT pages and install PDEs followed by single TLB flush.
-    pub(crate) fn execute_map(
+    fn execute_map(
         &mut self,
         mm: &GpuMm,
         prepared: PreparedMapping,
@@ -371,7 +452,7 @@ impl Vmm {
             vfn_alloc,
         } = prepared;
 
-        let walker = PtWalk::new(self.pdb_addr, self.mmu_version);
+        let walker = PtWalk::<M>::new(self.pdb_addr);
         let mut window = mm.pramin().get_window()?;
 
         // First, drain self.pt_pages, install all pending PDEs.
@@ -381,11 +462,11 @@ impl Vmm {
             let (install_addr, page) = node.to_key_value();
             let page_vram = VramAddress::new(page.alloc.iter().next().ok_or(ENOMEM)?.offset());
 
-            if page.level == self.mmu_version.dual_pde_level() {
-                let new_dpde = DualPde::new_small(self.mmu_version, Pfn::from(page_vram));
+            if page.level == M::DUAL_PDE_LEVEL {
+                let new_dpde = M::DualPde::new_small(Pfn::from(page_vram));
                 new_dpde.write(&mut window, install_addr)?;
             } else {
-                let new_pde = Pde::new_vram(self.mmu_version, Pfn::from(page_vram));
+                let new_pde = M::Pde::new_vram(Pfn::from(page_vram));
                 new_pde.write(&mut window, install_addr)?;
             }
 
@@ -405,7 +486,7 @@ impl Vmm {
 
             match result {
                 WalkResult::Unmapped { pte_addr } | WalkResult::Mapped { pte_addr, .. } => {
-                    let pte = Pte::new_vram(self.mmu_version, pfn, writable);
+                    let pte = M::Pte::new_vram(pfn, writable);
                     pte.write(&mut window, pte_addr)?;
                 }
                 WalkResult::PageTableMissing => {
@@ -433,7 +514,7 @@ impl Vmm {
     /// This is a convenience wrapper for callers outside the fence signalling critical
     /// path (e.g., BAR mappings). For DRM usecases, [`Vmm::prepare_map()`] and
     /// [`Vmm::execute_map()`] will be called separately.
-    pub(crate) fn map_pages(
+    fn map_pages(
         &mut self,
         mm: &GpuMm,
         pfns: &[Pfn],
@@ -465,9 +546,9 @@ impl Vmm {
     ///
     /// Takes the range by value (consumes it), then invalidates PTEs for the range,
     /// flushes the TLB, then drops the range (freeing the VA). PRAMIN lock is held.
-    pub(crate) fn unmap_pages(&mut self, mm: &GpuMm, range: MappedRange) -> Result {
-        let walker = PtWalk::new(self.pdb_addr, self.mmu_version);
-        let invalid_pte = Pte::invalid(self.mmu_version);
+    fn unmap_pages(&mut self, mm: &GpuMm, range: MappedRange) -> Result {
+        let walker = PtWalk::<M>::new(self.pdb_addr);
+        let invalid_pte = M::Pte::invalid();
 
         let mut window = mm.pramin().get_window()?;
         for i in 0..range.num_pages {

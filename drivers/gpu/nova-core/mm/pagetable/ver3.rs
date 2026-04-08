@@ -20,7 +20,11 @@
 use super::{
     AperturePde,
     AperturePte,
+    DualPdeOps,
+    Mmu,
     PageTableLevel,
+    PdeOps,
+    PteOps,
     VaLevelIndex, //
 };
 use crate::mm::{
@@ -50,33 +54,49 @@ impl VirtualAddressV3 {
 }
 
 impl VaLevelIndex for VirtualAddressV3 {
-    fn level_index(&self, level: u64) -> u64 {
+    fn level_index(&self, level: PageTableLevel) -> u64 {
         match level {
-            0 => self.pde4_idx(),
-            1 => self.pde3_idx(),
-            2 => self.pde2_idx(),
-            3 => self.pde1_idx(),
-            4 => self.pde0_idx(),
-            5 => self.pt_idx(),
-            _ => 0,
+            PageTableLevel::Pdb => self.pde4_idx(),
+            PageTableLevel::L1 => self.pde3_idx(),
+            PageTableLevel::L2 => self.pde2_idx(),
+            PageTableLevel::L3 => self.pde1_idx(),
+            PageTableLevel::L4 => self.pde0_idx(),
+            PageTableLevel::L5 => self.pt_idx(),
         }
     }
 }
 
-/// PDE levels for MMU v3 (6-level hierarchy).
-pub(crate) const PDE_LEVELS: &[PageTableLevel] = &[
-    PageTableLevel::Pdb,
-    PageTableLevel::L1,
-    PageTableLevel::L2,
-    PageTableLevel::L3,
-    PageTableLevel::L4,
-];
+/// MMU v3 marker type.
+pub(crate) struct MmuV3;
 
-/// PTE level for MMU v3.
-pub(crate) const PTE_LEVEL: PageTableLevel = PageTableLevel::L5;
+impl Mmu for MmuV3 {
+    type Va = VirtualAddressV3;
+    type Pte = Pte;
+    type Pde = Pde;
+    type DualPde = DualPde;
 
-/// Dual PDE level for MMU v3 (128-bit entries).
-pub(crate) const DUAL_PDE_LEVEL: PageTableLevel = PageTableLevel::L4;
+    const PDE_LEVELS: &'static [PageTableLevel] = &[
+        PageTableLevel::Pdb,
+        PageTableLevel::L1,
+        PageTableLevel::L2,
+        PageTableLevel::L3,
+        PageTableLevel::L4,
+    ];
+    const PTE_LEVEL: PageTableLevel = PageTableLevel::L5;
+    const DUAL_PDE_LEVEL: PageTableLevel = PageTableLevel::L4;
+
+    fn va(va: VirtualAddress) -> Self::Va {
+        VirtualAddressV3::new(va)
+    }
+
+    fn entries_per_page(level: PageTableLevel) -> usize {
+        match level {
+            PageTableLevel::Pdb => 2,
+            PageTableLevel::L4 => 256,
+            _ => 512,
+        }
+    }
+}
 
 // Page Classification Field (PCF) - 5 bits for PTEs in MMU v3.
 bitfield! {
@@ -151,29 +171,33 @@ bitfield! {
     }
 }
 
-impl Pte {
-    /// Create a PTE from a `u64` value.
-    pub(crate) fn new(val: u64) -> Self {
+impl PteOps for Pte {
+    fn new(val: u64) -> Self {
         Self(val)
     }
 
-    /// Create a valid PTE for video memory.
-    pub(crate) fn new_vram(frame: Pfn, writable: bool) -> Self {
+    fn invalid() -> Self {
+        Self::default()
+    }
+
+    fn new_vram(pfn: Pfn, writable: bool) -> Self {
         let pcf = if writable { PtePcf::rw() } else { PtePcf::ro() };
         Self::default()
             .set_valid(true)
             .set_aperture(AperturePte::VideoMemory)
             .set_pcf(pcf)
-            .set_frame_number(frame)
+            .set_frame_number(pfn)
     }
 
-    /// Create an invalid PTE.
-    pub(crate) fn invalid() -> Self {
-        Self::default()
+    fn is_valid(&self) -> bool {
+        self.valid()
     }
 
-    /// Get the raw `u64` value.
-    pub(crate) fn raw_u64(&self) -> u64 {
+    fn frame_number(&self) -> Pfn {
+        (*self).frame_number()
+    }
+
+    fn raw_u64(&self) -> u64 {
         self.0
     }
 }
@@ -190,42 +214,40 @@ bitfield! {
     }
 }
 
-impl Pde {
-    /// Create a PDE from a `u64` value.
-    pub(crate) fn new(val: u64) -> Self {
+impl PdeOps for Pde {
+    fn new(val: u64) -> Self {
         Self(val)
     }
 
-    /// Create a valid PDE pointing to a page table in video memory.
-    pub(crate) fn new_vram(table_pfn: Pfn) -> Self {
+    fn new_vram(table_pfn: Pfn) -> Self {
         Self::default()
             .set_is_pte(false)
             .set_aperture(AperturePde::VideoMemory)
             .set_table_frame(table_pfn)
     }
 
-    /// Create an invalid PDE.
-    pub(crate) fn invalid() -> Self {
-        Self::default().set_aperture(AperturePde::Invalid)
+    fn is_valid(&self) -> bool {
+        (*self).aperture() != AperturePde::Invalid
     }
 
-    /// Check if this PDE is valid.
-    pub(crate) fn is_valid(&self) -> bool {
-        self.aperture() != AperturePde::Invalid
+    fn aperture(&self) -> AperturePde {
+        (*self).aperture()
     }
 
-    /// Get the VRAM address of the page table.
-    pub(crate) fn table_vram_address(&self) -> VramAddress {
+    fn table_frame(&self) -> Pfn {
+        (*self).table_frame()
+    }
+
+    fn table_vram_address(&self) -> VramAddress {
         debug_assert!(
-            self.aperture() == AperturePde::VideoMemory,
+            (*self).aperture() == AperturePde::VideoMemory,
             "table_vram_address called on non-VRAM PDE (aperture: {:?})",
-            self.aperture()
+            (*self).aperture()
         );
         VramAddress::from(self.table_frame())
     }
 
-    /// Get the raw `u64` value.
-    pub(crate) fn raw_u64(&self) -> u64 {
+    fn raw_u64(&self) -> u64 {
         self.0
     }
 }
@@ -308,30 +330,42 @@ pub(crate) struct DualPde {
     pub(crate) small: Pde,
 }
 
-impl DualPde {
-    /// Create a dual PDE from raw 128-bit value (two `u64`s).
-    pub(crate) fn new(big: u64, small: u64) -> Self {
+impl DualPdeOps for DualPde {
+    fn new(big: u64, small: u64) -> Self {
         Self {
             big: DualPdeBig::new(big),
             small: Pde::new(small),
         }
     }
 
-    /// Create a dual PDE with only the small page table pointer set.
-    pub(crate) fn new_small(table_pfn: Pfn) -> Self {
+    fn new_small(table_pfn: Pfn) -> Self {
         Self {
             big: DualPdeBig::invalid(),
             small: Pde::new_vram(table_pfn),
         }
     }
 
-    /// Check if the small page table pointer is valid.
-    pub(crate) fn has_small(&self) -> bool {
+    fn has_small(&self) -> bool {
         self.small.is_valid()
     }
 
-    /// Check if the big page table pointer is valid.
-    pub(crate) fn has_big(&self) -> bool {
+    fn has_big(&self) -> bool {
         self.big.is_valid()
+    }
+
+    fn small_pfn(&self) -> Pfn {
+        self.small.table_frame()
+    }
+
+    fn small_vram_address(&self) -> VramAddress {
+        self.small.table_vram_address()
+    }
+
+    fn big_raw_u64(&self) -> u64 {
+        self.big.raw_u64()
+    }
+
+    fn small_raw_u64(&self) -> u64 {
+        self.small.raw_u64()
     }
 }

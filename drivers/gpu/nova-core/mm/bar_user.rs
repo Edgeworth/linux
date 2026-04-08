@@ -8,6 +8,15 @@ use kernel::{
     prelude::*, //
 };
 
+#[cfg(CONFIG_NOVA_MM_SELFTESTS)]
+use crate::mm::pagetable::{
+    ver2::MmuV2,
+    ver3::MmuV3,
+    AperturePde,
+    Mmu,
+    MmuVersion,
+    PdeOps, //
+};
 use crate::{
     driver::Bar1,
     gpu::Chipset,
@@ -155,22 +164,25 @@ impl Drop for BarAccess<'_> {
 ///
 /// Returns `Err(ENOENT)` if page tables are missing or not in VRAM.
 #[cfg(CONFIG_NOVA_MM_SELFTESTS)]
-fn check_valid_page_tables(mm: &GpuMm, pdb_addr: VramAddress, chipset: Chipset) -> Result {
-    use crate::mm::pagetable::AperturePde;
-
+fn check_valid_page_tables_mmu<M: Mmu>(mm: &GpuMm, pdb_addr: VramAddress) -> Result {
     let mut window = mm.pramin().get_window()?;
-    let pdb_entry_raw = window.try_read64(pdb_addr.raw())?;
-    let pdb_entry = crate::mm::pagetable::Pde::new(chipset.mmu_version(), pdb_entry_raw);
-
-    if !pdb_entry.is_valid() {
-        return Err(ENOENT);
-    }
-
-    if pdb_entry.aperture() != AperturePde::VideoMemory {
+    let pdb_entry = M::Pde::read(&mut window, pdb_addr)?;
+    if !pdb_entry.is_valid() || pdb_entry.aperture() != AperturePde::VideoMemory {
         return Err(ENOENT);
     }
 
     Ok(())
+}
+
+/// Check if the PDB has valid, VRAM-backed page tables.
+///
+/// Returns `Err(ENOENT)` if page tables are missing or not in VRAM.
+#[cfg(CONFIG_NOVA_MM_SELFTESTS)]
+fn check_valid_page_tables(mm: &GpuMm, pdb_addr: VramAddress, mmu_version: MmuVersion) -> Result {
+    match mmu_version {
+        MmuVersion::V2 => check_valid_page_tables_mmu::<MmuV2>(mm, pdb_addr),
+        MmuVersion::V3 => check_valid_page_tables_mmu::<MmuV3>(mm, pdb_addr),
+    }
 }
 
 /// Run MM subsystem self-tests during probe.
@@ -205,9 +217,10 @@ pub(crate) fn run_self_test(
     dev_info!(dev, "MM: Starting self-test...\n");
 
     let pdb_addr = VramAddress::new(bar1_pdb);
+    let mmu_version = chipset.mmu_version();
 
     // Check if initial page tables are in VRAM.
-    if check_valid_page_tables(mm, pdb_addr, chipset).is_err() {
+    if check_valid_page_tables(mm, pdb_addr, mmu_version).is_err() {
         dev_info!(dev, "MM: Self-test SKIPPED - no valid VRAM page tables\n");
         return Ok(());
     }
@@ -227,7 +240,7 @@ pub(crate) fn run_self_test(
     let test_pfn = Pfn::from(test_vram);
 
     // Create a VMM of size 64K to track virtual memory mappings.
-    let mut vmm = Vmm::new(pdb_addr, chipset.mmu_version(), SZ_64K.into_safe_cast())?;
+    let mut vmm = Vmm::new(pdb_addr, mmu_version, SZ_64K.into_safe_cast())?;
 
     // Create a test mapping.
     let mapped = vmm.map_pages(mm, &[test_pfn], None, true)?;
