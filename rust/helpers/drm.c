@@ -3,6 +3,9 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_vma_manager.h>
+#ifdef CONFIG_DRM_TTM
+#include <drm/ttm/ttm_bo.h>
+#endif /* CONFIG_DRM_TTM */
 
 #ifdef CONFIG_DRM
 
@@ -75,4 +78,14 @@ rust_helper_drm_gem_shmem_object_mmap(struct drm_gem_object *obj, struct vm_area
 }
 
 #endif /* CONFIG_DRM_GEM_SHMEM_HELPER */
+
+#ifdef CONFIG_DRM_TTM
+__rust_helper void
+rust_helper_ttm_bo_move_null(struct ttm_buffer_object *bo,
+			     struct ttm_resource *new_mem)
+{
+	ttm_bo_move_null(bo, new_mem);
+}
+
+#endif /* CONFIG_DRM_TTM */
 #endif /* CONFIG_DRM */

@@ -17,7 +17,16 @@
 //! [`Arc`]: crate::sync::Arc
 //! [`Arc<T>`]: crate::sync::Arc
 
+use core::pin::Pin;
 use core::{marker::PhantomData, mem::ManuallyDrop, ops::Deref, ptr::NonNull};
+
+use pin_init::pin_data;
+
+use crate::alloc::KBox;
+use crate::init::InPlaceInit;
+use crate::prelude::*;
+use crate::workqueue::{system_unbound, Work, WorkItem};
+use crate::{impl_has_work, new_work, pr_warn, try_pin_init};
 
 /// Types that are _always_ reference counted.
 ///
@@ -190,5 +199,55 @@ where
     #[inline]
     fn eq(&self, other: &&U) -> bool {
         T::eq(&**self, other)
+    }
+}
+
+// TODO: there is probably a better way to do this...
+// and we should have a way to wait on all drops to be completed.
+#[pin_data]
+struct DeferredARefInner<T: AlwaysRefCounted + Sync + Send> {
+    aref: ARef<T>,
+    #[pin]
+    work: Work<Self>,
+}
+
+impl_has_work! {
+    impl{T: AlwaysRefCounted + Sync + Send} HasWork<Self> for DeferredARefInner<T> { self.work }
+}
+
+impl<T: AlwaysRefCounted + Sync + Send> WorkItem for DeferredARefInner<T> {
+    type Pointer = Pin<KBox<Self>>;
+
+    fn run(this: Self::Pointer) {
+        pr_warn!("DeferredARef::run dropping ARef {:p}\n", this.as_ref());
+        drop(this);
+    }
+}
+
+/// TODO: docs.
+pub struct DeferredARef<T: AlwaysRefCounted + Sync + Send + 'static> {
+    inner: Option<Pin<KBox<DeferredARefInner<T>>>>,
+}
+
+impl<T: AlwaysRefCounted + Sync + Send + 'static> DeferredARef<T> {
+    /// TODO: docs.
+    pub fn new(data: &T) -> Result<Self> {
+        Ok(Self {
+            inner: Some(KBox::try_pin_init(
+                try_pin_init!(DeferredARefInner {
+                    aref: ARef::from(data),
+                    work <- new_work!("deferred destroy ARef"),
+                }),
+                GFP_KERNEL,
+            )?),
+        })
+    }
+}
+
+impl<T: AlwaysRefCounted + Sync + Send + 'static> Drop for DeferredARef<T> {
+    fn drop(&mut self) {
+        if let Some(work) = self.inner.take() {
+            system_unbound().enqueue(work);
+        }
     }
 }

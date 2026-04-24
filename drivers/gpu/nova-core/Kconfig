@@ -3,6 +3,11 @@ config NOVA_CORE
 	depends on 64BIT
 	depends on PCI
 	depends on RUST
+	depends on DRM
+	depends on DRM_TTM
+	select DRM_GEM_SHMEM_HELPER
+	select RUST_DRM_GEM_SHMEM_HELPER
+	select DRM_GPUVM
 	select AUXILIARY_BUS
 	select RUST_FW_LOADER_ABSTRACTIONS
 	default n

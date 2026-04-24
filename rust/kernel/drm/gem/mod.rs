@@ -29,6 +29,8 @@ use core::{
 #[cfg(CONFIG_RUST_DRM_GEM_SHMEM_HELPER)]
 pub mod shmem;
 
+pub mod ttm;
+
 /// A macro for implementing [`AlwaysRefCounted`] for any GEM object type.
 ///
 /// Since all GEM objects use the same refcounting scheme.
@@ -44,18 +46,18 @@ macro_rules! impl_aref_for_gem_obj {
         // SAFETY: All GEM objects are refcounted.
         unsafe impl $( <$( $tparam_id ),+> )? $crate::sync::aref::AlwaysRefCounted for $type
         where
-            Self: IntoGEMObject,
+            Self: $crate::drm::gem::IntoGEMObject,
             $( $( $bind_param : $bind_trait ),+ )?
         {
             fn inc_ref(&self) {
                 // SAFETY: The existence of a shared reference guarantees that the refcount is
                 // non-zero.
-                unsafe { bindings::drm_gem_object_get(self.as_raw()) };
+                unsafe { bindings::drm_gem_object_get(<Self as $crate::drm::gem::IntoGEMObject>::as_raw(self)) };
             }
 
             unsafe fn dec_ref(obj: core::ptr::NonNull<Self>) {
                 // SAFETY: `obj` is a valid pointer to an `Object<T>`.
-                let obj = unsafe { obj.as_ref() }.as_raw();
+                let obj = <Self as $crate::drm::gem::IntoGEMObject>::as_raw(unsafe { obj.as_ref() });
 
                 // SAFETY: The safety requirements guarantee that the refcount is non-zero.
                 unsafe { bindings::drm_gem_object_put(obj) };
@@ -278,7 +280,13 @@ impl<T: DriverObject> Object<T> {
         unsafe { (*obj.as_raw()).funcs = &Self::OBJECT_FUNCS };
 
         // SAFETY: The arguments are all valid per the type invariants.
-        to_result(unsafe { bindings::drm_gem_object_init(dev.as_raw(), obj.obj.get(), size) })?;
+        let res =
+            to_result(unsafe { bindings::drm_gem_object_init(dev.as_raw(), obj.obj.get(), size) });
+        if let Err(e) = res {
+            // SAFETY: Must be called on a failed `drm_gem_object_init` to free the partially initialized object.
+            unsafe { bindings::drm_gem_private_object_fini(obj.obj.get()) };
+            return Err(e);
+        }
 
         // SAFETY: We will never move out of `Self` as `ARef<Self>` is always treated as pinned.
         let ptr = KBox::into_raw(unsafe { Pin::into_inner_unchecked(obj) });
