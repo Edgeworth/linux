@@ -22,6 +22,7 @@ use kernel::{
 pub(crate) mod cmdq;
 pub(crate) mod commands;
 mod fw;
+mod nvkv;
 mod sequencer;
 
 pub(crate) use fw::{
